@@ -1,0 +1,9 @@
+# Saved channel DOM contains real users' messages — keep out of the repo
+# by default; force-add a scrubbed copy if needed (git add -f).
+extension/fixtures/*.html
+
+# Processor secrets (step 2+)
+server/.env
+*.sqlite3
+*.db
+__pycache__/

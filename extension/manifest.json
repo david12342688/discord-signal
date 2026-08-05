@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Discord Signal Capture",
+  "version": "0.1.0",
+  "description": "Passive, read-only observer of Discord messages already rendered in this browser. Forwards them to your own processor. Never talks to Discord.",
+  "permissions": ["storage", "alarms"],
+  "optional_host_permissions": ["https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://discord.com/*", "https://*.discord.com/*"],
+      "js": ["selectors.js", "capture.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Discord Signal Capture"
+  }
+}
