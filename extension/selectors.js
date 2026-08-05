@@ -50,18 +50,27 @@
     return el ? el.textContent.replace(/\s+/g, ' ').trim() : '';
   }
 
+  // The username node's full textContent includes decorations — bot "APP"
+  // badges, server tags, role text — concatenated after the name. The plain
+  // name lives in the first child span; take that and fall back to full text.
+  function authorFrom(el) {
+    if (!el) return null;
+    const name = textOf(el.firstElementChild) || textOf(el);
+    return name || null;
+  }
+
   // Grouped messages (same author, short interval) omit the username header.
   // The node is freshly inserted at capture time, so earlier siblings are
   // still mounted — walk back to the nearest <li> that has one.
   function findAuthor(li) {
-    const direct = li.querySelector(sel.username);
-    if (direct) return textOf(direct);
+    const direct = authorFrom(li.querySelector(sel.username));
+    if (direct) return direct;
     let prev = li.previousElementSibling;
     let steps = 0;
     while (prev && steps++ < 80) {
       if (LIST_ITEM_ID_RE.test(prev.id || '')) {
-        const u = prev.querySelector(sel.username);
-        if (u) return textOf(u);
+        const author = authorFrom(prev.querySelector(sel.username));
+        if (author) return author;
       }
       prev = prev.previousElementSibling;
     }
