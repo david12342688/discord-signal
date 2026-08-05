@@ -94,34 +94,12 @@ def heuristic_tier(msg: dict, entities: list[dict]) -> tuple[int | None, str]:
     return None, ""  # ambiguous -> LLM
 
 
-# --- LLM triage --------------------------------------------------------------
-
-TRIAGE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "results": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "message_id": {"type": "string"},
-                    "tier": {"type": "integer", "enum": [1, 2, 3]},
-                    "reason": {"type": "string"},
-                    "confident": {"type": "boolean"},
-                },
-                "required": ["message_id", "tier", "reason", "confident"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["results"],
-    "additionalProperties": False,
-}
+# --- LLM triage (OpenRouter) --------------------------------------------------
 
 TRIAGE_SYSTEM = """You triage messages from a high-noise memecoin trading Discord channel.
 Assign each message a tier:
 
-TIER 1 (push alert): actionable trading signal — conviction entry/exit calls, credible
+TIER 1 (push alert): actionable trading signal - conviction entry/exit calls, credible
 rug/scam warnings, time-sensitive events (launches, snapshots, listings), whale movement
 reports, contract shares with context.
 TIER 2 (digest only): meta/narrative shifts, sustained token discussion without a hard
@@ -129,22 +107,57 @@ call, market structure observations, useful links or research.
 TIER 3 (drop): banter, hopium, cope, portfolio crying, price commentary with nothing
 actionable, in-jokes, arguments, reaction chatter.
 
-Watch for sarcasm: "this is definitely not a rug" usually means it IS suspicious — that
-is tier 1 warning material. Reply context (marked "replying to:") may change meaning.
-Set confident=false only when the message genuinely could be tier 1 but you cannot tell."""
+Watch for sarcasm: "this is definitely not a rug" usually means it IS suspicious - that
+is tier 1 warning material. Reply context (field "replying_to") may change meaning.
+Set confident=false only when the message genuinely could be tier 1 but you cannot tell.
+
+Reply ONLY with a JSON object, no other text:
+{"results": [{"message_id": "<id>", "tier": <1|2|3>, "reason": "<short>", "confident": <bool>}]}"""
+
+
+def _openrouter_chat(model: str, payload: list[dict]) -> list[dict]:
+    import httpx
+
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    resp = httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": TRIAGE_SYSTEM},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+        },
+        timeout=120,
+    )
+    data = resp.json()
+    if "choices" not in data:
+        log.warning("openrouter %s error: %s", model, str(data)[:200])
+        return []
+    text = data["choices"][0]["message"]["content"]
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        log.warning("openrouter %s unparseable output", model)
+        return []
+    try:
+        return json.loads(m.group(0))["results"]
+    except (json.JSONDecodeError, KeyError) as e:
+        log.warning("openrouter %s bad json: %s", model, e)
+        return []
 
 
 def llm_triage(messages: list[dict]) -> dict[str, tuple[int, str]]:
     """Classify ambiguous messages in batches. Returns {message_id: (tier, reason)}.
     Empty dict if no API key is configured (caller applies the fallback)."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not messages or not os.environ.get("OPENROUTER_API_KEY"):
         return {}
-    import anthropic
 
-    client = anthropic.Anthropic()
-    triage_model = _C.get("llm", {}).get("triage_model", "claude-haiku-4-5")
-    escalation_model = _C.get("llm", {}).get("escalation_model", "claude-opus-5")
-    batch_size = _C.get("llm", {}).get("batch_size", 30)
+    cfg = _C.get("llm", {})
+    triage_model = cfg.get("triage_model", "google/gemini-2.5-flash-lite")
+    escalation_model = cfg.get("escalation_model", "deepseek/deepseek-v4-flash-0731")
+    batch_size = cfg.get("batch_size", 30)
 
     out: dict[str, tuple[int, str]] = {}
     unsure: list[dict] = []
@@ -159,33 +172,26 @@ def llm_triage(messages: list[dict]) -> dict[str, tuple[int, str]]:
             }
             for m in batch
         ]
-        resp = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=TRIAGE_SYSTEM,
-            output_config={"format": {"type": "json_schema", "schema": TRIAGE_SCHEMA}},
-            messages=[{"role": "user", "content": json.dumps(payload)}],
-        )
-        if resp.stop_reason == "refusal":
-            return []
-        text = next(b.text for b in resp.content if b.type == "text")
-        return json.loads(text)["results"]
+        return _openrouter_chat(model, payload)
 
     for i in range(0, len(messages), batch_size):
         batch = messages[i : i + batch_size]
         by_id = {m["message_id"]: m for m in batch}
         for r in run(triage_model, batch):
-            if r["message_id"] not in by_id:
+            mid, tier = str(r.get("message_id")), r.get("tier")
+            if mid not in by_id or tier not in (1, 2, 3):
                 continue
-            if r["confident"]:
-                out[r["message_id"]] = (r["tier"], f"llm: {r['reason']}")
+            if r.get("confident", True):
+                out[mid] = (tier, f"llm: {r.get('reason', '')}")
             else:
-                unsure.append(by_id[r["message_id"]])
+                unsure.append(by_id[mid])
 
     # Genuinely ambiguous cases escalate to the stronger model.
     for i in range(0, len(unsure), batch_size):
         for r in run(escalation_model, unsure[i : i + batch_size]):
-            out[r["message_id"]] = (r["tier"], f"llm+: {r['reason']}")
+            mid, tier = str(r.get("message_id")), r.get("tier")
+            if tier in (1, 2, 3):
+                out[mid] = (tier, f"llm+: {r.get('reason', '')}")
 
     return out
 
