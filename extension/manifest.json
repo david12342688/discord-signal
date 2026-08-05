@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Passive, read-only observer of Discord messages already rendered in this browser. Forwards them to your own processor. Never talks to Discord.",
   "permissions": ["storage", "alarms"],
-  "optional_host_permissions": ["https://*/*"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": {
     "service_worker": "background.js"
   },

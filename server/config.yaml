@@ -1,0 +1,26 @@
+# Every threshold lives here — nothing tunable is hardcoded in the modules.
+# Sections are added as pipeline stages are built (build order steps 3-6).
+
+server:
+  host: 0.0.0.0
+  port: 8787
+  max_batch: 500            # messages per POST; larger batches are rejected
+  max_content_chars: 8000   # per-field truncation caps
+  max_embed_chars: 4000
+  max_embeds: 25
+  max_links: 50
+
+db:
+  path: signal.db           # relative to the server/ directory
+
+channels:
+  # Channel IDs to accept. Empty list = accept whatever the extension sends
+  # (the extension has its own allowlist; this is defense in depth).
+  allowlist: []
+
+watchdog:
+  # Alert if zero messages arrive for this long during active hours.
+  quiet_minutes: 60
+  # Hours (UTC, inclusive start / exclusive end) when the channel is normally
+  # active and silence is suspicious. 0-24 = always.
+  active_hours_utc: [0, 24]

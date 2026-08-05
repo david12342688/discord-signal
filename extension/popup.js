@@ -88,8 +88,11 @@ $('save').addEventListener('click', async () => {
   // here inside the click gesture.
   if (endpoint && !config.consoleOnly) {
     try {
-      const origin = new URL(endpoint).origin + '/*';
-      const granted = await chrome.permissions.request({ origins: [origin] });
+      // Match patterns must not contain a port — pattern by scheme+host only.
+      const u = new URL(endpoint);
+      const granted = await chrome.permissions.request({
+        origins: [`${u.protocol}//${u.hostname}/*`],
+      });
       if (!granted) {
         $('saveMsg').textContent = 'Saved, but host permission was denied — posting will fail.';
         $('saveMsg').className = 'warn';
