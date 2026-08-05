@@ -85,10 +85,25 @@
     return t ? t.getAttribute('datetime') : null;
   }
 
+  // A reply <li> contains TWO message-content nodes: the quoted parent's
+  // preview (carrying the PARENT's message id) inside the reply context, and
+  // the reply's own body (carrying its OWN id). Match by exact id so replies
+  // aren't extracted as a copy of their parent.
+  function findContent(li, messageId) {
+    const own = li.querySelector(`[id="message-content-${messageId}"]`);
+    if (own) return own;
+    for (const el of li.querySelectorAll(sel.content)) {
+      if (!el.closest(sel.replyContext)) return el;
+    }
+    return null;
+  }
+
   function findReplyContext(li) {
     const ctx = li.querySelector(sel.replyContext);
     if (!ctx) return null;
-    return { preview: textOf(ctx) };
+    const preview = ctx.querySelector(sel.content);
+    const m = preview ? /^message-content-(\d+)/.exec(preview.id) : null;
+    return { parentId: m ? m[1] : null, preview: textOf(ctx) };
   }
 
   function findEmbeds(li) {
@@ -109,6 +124,7 @@
   function findLinks(li) {
     const out = [];
     for (const a of li.querySelectorAll('a[href]')) {
+      if (a.closest(sel.replyContext)) continue; // parent's links, not ours
       const href = a.href;
       if (href && href.startsWith('http') && !out.includes(href)) out.push(href);
     }
@@ -128,7 +144,7 @@
       author: findAuthor(li),
       timestamp: ts,
       timestampApprox: ts === null,
-      content: textOf(li.querySelector(sel.content)),
+      content: textOf(findContent(li, idInfo.messageId)),
       embeds: findEmbeds(li),
       links: findLinks(li),
       reply: findReplyContext(li),
