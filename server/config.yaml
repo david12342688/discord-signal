@@ -4,6 +4,7 @@
 server:
   host: 0.0.0.0
   port: 8787
+  public_url: http://91.99.171.13:8787  # used for digest links in notifications
   max_batch: 500            # messages per POST; larger batches are rejected
   max_content_chars: 8000   # per-field truncation caps
   max_embed_chars: 4000
@@ -36,6 +37,9 @@ classify:
   consensus:
     window_minutes: 15        # 3+ distinct authors on one token inside this window
     min_authors: 3
+  context:
+    post_ca_minutes: 10       # short messages from a recent contract-poster keep context
+  known_ticker_min_len: 3     # bare-ticker matching for tokens already seen in-channel
   llm:
     # Benchmarked 2026-08-05 on 20 real+probe messages: flash-lite had 5/5
     # tier-1 recall at $0.08/10k msgs and ~1s latency; deepseek-v4-flash was
@@ -44,6 +48,14 @@ classify:
     triage_model: google/gemini-2.5-flash-lite
     escalation_model: deepseek/deepseek-v4-flash-0731
     batch_size: 30
+
+alerts:
+  max_per_hour: 20            # generation cap — a burst can't spam you
+  max_per_poll: 5             # extension shows at most this many per poll (1/min)
+  digest_hour_utc: 8          # daily "digest ready" nudge after this UTC hour
+
+pipeline:
+  tick_seconds: 30            # classify/enrich/alert loop cadence
 
 watchdog:
   # Alert if zero messages arrive for this long during active hours.

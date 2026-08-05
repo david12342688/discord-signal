@@ -41,6 +41,9 @@ const BACKOFF_BASE_S = 30;
 const BACKOFF_CAP_S = 600;
 const RETRY_ALARM = 'dsx-retry';
 const TICK_ALARM = 'dsx-tick';
+const ALERTS_ALARM = 'dsx-alerts';
+const LAST_ALERT_KEY = 'dsxLastAlertId';
+const ALERT_URLS_KEY = 'dsxAlertUrls';
 
 // Serialize all buffer/stats read-modify-write cycles so a capture batch
 // arriving mid-POST can't clobber the buffer.
@@ -77,6 +80,8 @@ async function init() {
   // Safety-net alarm: retries posting if a one-off retry alarm was lost to a
   // browser restart. No-op in console-only mode or when the buffer is empty.
   chrome.alarms.create(TICK_ALARM, { periodInMinutes: 1 });
+  // Alert polling: desktop notifications for signals the processor found.
+  chrome.alarms.create(ALERTS_ALARM, { periodInMinutes: 1 });
   await updateBadge();
 }
 
@@ -168,7 +173,58 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (cfg.consoleOnly || !cfg.endpoint) return;
     const r = await chrome.storage.local.get(BUF_KEY);
     if ((r[BUF_KEY] || []).length) tryPost();
+  } else if (alarm.name === ALERTS_ALARM) {
+    pollAlerts();
   }
+});
+
+// --- alert notifications ------------------------------------------------------
+
+async function pollAlerts() {
+  const cfg = await getConfig();
+  if (cfg.consoleOnly || !cfg.endpoint || !cfg.enabled) return;
+  const base = cfg.endpoint.replace(/\/ingest\/?$/, '');
+  const r = await chrome.storage.local.get([LAST_ALERT_KEY, ALERT_URLS_KEY]);
+  const after = r[LAST_ALERT_KEY] || 0;
+  let data;
+  try {
+    const res = await fetch(`${base}/alerts?after=${after}`, {
+      headers: { 'X-Capture-Auth': cfg.secret || '' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (e) {
+    console.warn('[DSX bg] alert poll failed:', String(e));
+    return;
+  }
+  if (!data.alerts || !data.alerts.length) return;
+
+  const urls = r[ALERT_URLS_KEY] || {};
+  let lastId = after;
+  for (const alert of data.alerts) {
+    lastId = Math.max(lastId, alert.id);
+    const notifId = `dsx-${alert.id}`;
+    if (alert.url) urls[notifId] = alert.url;
+    chrome.notifications.create(notifId, {
+      type: 'basic',
+      iconUrl: 'icon128.png',
+      title: alert.title || 'Signal',
+      message: (alert.body || '').slice(0, 500),
+      priority: alert.kind === 'tier1' || alert.kind === 'consensus' ? 2 : 0,
+      requireInteraction: alert.kind === 'consensus',
+    });
+  }
+  // keep the click-through map small
+  const keys = Object.keys(urls);
+  if (keys.length > 50) for (const k of keys.slice(0, keys.length - 50)) delete urls[k];
+  await chrome.storage.local.set({ [LAST_ALERT_KEY]: lastId, [ALERT_URLS_KEY]: urls });
+}
+
+chrome.notifications.onClicked.addListener(async (notifId) => {
+  const r = await chrome.storage.local.get(ALERT_URLS_KEY);
+  const url = (r[ALERT_URLS_KEY] || {})[notifId];
+  if (url) chrome.tabs.create({ url });
+  chrome.notifications.clear(notifId);
 });
 
 // --- badge -------------------------------------------------------------------

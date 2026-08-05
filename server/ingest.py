@@ -1,22 +1,32 @@
-"""Ingest endpoint: receives batched messages from the capture extension.
+"""Ingest endpoint + pipeline host.
 
 POST /ingest   shared-secret auth -> validate -> dedupe on message id -> SQLite
+GET  /alerts   shared-secret auth -> alerts after ?after=<id> (extension polls)
+GET  /digest   digest page, ?key=<secret> (browser view)
 GET  /health   liveness + basic counters (no auth, exposes no message content)
+
+A background thread runs the classify/enrich/alert loop every
+pipeline.tick_seconds.
 
 Run:  .venv/bin/uvicorn ingest:app --host 0.0.0.0 --port 8787
 """
 
 import hmac
+import html
 import json
 import logging
 import os
+import threading
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
 import yaml
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -84,9 +94,47 @@ def require_auth(x_capture_auth: Annotated[str, Header()] = "") -> None:
         raise HTTPException(401, "bad auth")
 
 
+# --- background pipeline loop -------------------------------------------------
+
+def _pipeline_loop(stop: threading.Event):
+    import classify
+    import notify
+
+    tick = CONFIG.get("pipeline", {}).get("tick_seconds", 30)
+    while not stop.is_set():
+        try:
+            conn = db.connect(CONFIG["db"]["path"])
+            try:
+                stats = classify.process_pending(conn)
+                if stats["processed"]:
+                    log.info("pipeline: %s", stats)
+                n = notify.generate_alerts(conn)
+                if n:
+                    log.info("pipeline: %d new alerts", n)
+                notify.watchdog_check(conn)
+                public = CONFIG["server"].get("public_url", "").rstrip("/")
+                digest_url = f"{public}/digest?key={INGEST_SECRET}" if public else None
+                notify.digest_ready_check(conn, digest_url)
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("pipeline tick failed")
+        stop.wait(tick)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    stop = threading.Event()
+    t = threading.Thread(target=_pipeline_loop, args=(stop,), daemon=True, name="pipeline")
+    t.start()
+    log.info("pipeline loop started")
+    yield
+    stop.set()
+
+
 # --- app ---------------------------------------------------------------------
 
-app = FastAPI(title="discord-signal ingest")
+app = FastAPI(title="discord-signal ingest", lifespan=lifespan)
 
 
 @app.post("/ingest", dependencies=[Depends(require_auth)])
@@ -165,6 +213,41 @@ def ingest(batch: Batch) -> dict:
         "duplicate": duplicate,
         "ignored": ignored,
     }
+
+
+@app.get("/alerts", dependencies=[Depends(require_auth)])
+def alerts(after: int = 0) -> dict:
+    import notify
+
+    conn = db.connect(CONFIG["db"]["path"])
+    try:
+        items = notify.alerts_after(conn, after)
+    finally:
+        conn.close()
+    return {"ok": True, "alerts": items}
+
+
+@app.get("/digest", response_class=HTMLResponse)
+def digest_page(key: Annotated[str, Query()] = "") -> str:
+    if not INGEST_SECRET or not hmac.compare_digest(key, INGEST_SECRET):
+        raise HTTPException(401, "bad key")
+    import digest as digest_mod
+
+    conn = db.connect(CONFIG["db"]["path"])
+    try:
+        md = digest_mod.render_markdown(digest_mod.build_digest(conn))
+    finally:
+        conn.close()
+    body = html.escape(md)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signal Digest</title>
+<style>
+ body {{ background:#15171C; color:#E6E3DA; font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;
+        max-width: 900px; margin: 0 auto; padding: 32px 16px; }}
+ pre {{ white-space: pre-wrap; word-break: break-word; }}
+ a {{ color:#E8A62B; }}
+</style></head><body><pre>{body}</pre></body></html>"""
 
 
 @app.get("/health")

@@ -3,7 +3,8 @@
   "name": "Discord Signal Capture",
   "version": "0.1.0",
   "description": "Passive, read-only observer of Discord messages already rendered in this browser. Forwards them to your own processor. Never talks to Discord.",
-  "permissions": ["storage", "alarms"],
+  "permissions": ["storage", "alarms", "notifications"],
+  "icons": { "128": "icon128.png" },
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": {
     "service_worker": "background.js"

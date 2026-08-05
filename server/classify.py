@@ -46,11 +46,14 @@ CALL_WORDS = re.compile(
     r"\b(ape(d|ing)?|bid(ding)?|buy(ing)?|bought|long(ed)?|short(ed)?|"
     r"entry|entered|sold|selling|sell|took profit|tp'?d|full port|"
     r"accumulat(e|ing|ed)|loaded|load(ing)? up|sent it|degen'?d)\b", re.I)
-TIME_SENSITIVE = re.compile(
-    r"\b(launch(es|ing)?\s+(at|in|soon|today|tonight)|presale|"
-    r"stealth launch|snapshot\s+(at|in|today)|airdrop\s+(claim|live)|"
-    r"listing\s+(on|at)|binance list|coinbase list|deploy(s|ing)?\s+(at|in|soon)|"
-    r"in \d+ ?(min|minute|hour|h)s?\b)", re.I)
+# Time-sensitive needs BOTH an event word and a time phrase — a bare
+# "in 10 mins" is commentary, not an event (tuning fix 2026-08-05).
+TIME_EVENT = re.compile(
+    r"\b(launch(es|ing)?|presale|snapshot|airdrop|listing|list(s|ed)?\s+on|"
+    r"deploy(s|ing|ed)?|mint(ing)?|tge|ico|cex)\b", re.I)
+TIME_PHRASE = re.compile(
+    r"\b(in \d+ ?(min|minute|hour|h)s?|at \d{1,2}(:\d{2})? ?(utc|am|pm|est|cet)?|"
+    r"today|tonight|tomorrow|soon|now live|is live)\b", re.I)
 META_WORDS = re.compile(
     r"\b(meta|narrative|rotat(e|ing|ion)|szn|season)\b", re.I)
 
@@ -66,7 +69,7 @@ def heuristic_tier(msg: dict, entities: list[dict]) -> tuple[int | None, str]:
         return 1, "warning language (rug/scam/dev activity)"
     if has_contract:
         return 1, "contract address posted"
-    if TIME_SENSITIVE.search(text):
+    if TIME_EVENT.search(text) and TIME_PHRASE.search(text):
         return 1, "time-sensitive (launch/presale/listing/snapshot)"
     if (has_ticker or has_contract) and CALL_WORDS.search(text):
         return 1, "entry/exit call on a named token"
@@ -212,6 +215,30 @@ def process_pending(conn) -> dict:
     ambiguous: list[dict] = []
     decided: dict[str, tuple[int, str]] = {}
 
+    # Tuning fix: someone who just posted a contract gets context — their next
+    # short messages ("i am in this") aren't banter.
+    post_ca_min = _C.get("context", {}).get("post_ca_minutes", 10)
+    last_ca_by_author: dict[str, datetime] = {}
+    for r in conn.execute(
+        """SELECT author, MAX(mentioned_at) AS t FROM mentions
+           WHERE kind = 'contract' AND author IS NOT NULL GROUP BY author"""
+    ):
+        try:
+            last_ca_by_author[r["author"]] = datetime.fromisoformat(r["t"])
+        except (TypeError, ValueError):
+            pass
+
+    # Tuning fix: bare tickers (no $) match once the token is known in-channel.
+    min_len = _C.get("known_ticker_min_len", 3)
+    known_tickers = {
+        r["ticker"].upper(): r["token_key"]
+        for r in conn.execute(
+            "SELECT ticker, COALESCE(alias_of, token_key) AS token_key FROM tokens "
+            "WHERE ticker IS NOT NULL"
+        )
+        if len(r["ticker"] or "") >= min_len
+    }
+
     for row in rows:
         msg = dict(row)
         entities = extract.extract_entities(
@@ -219,10 +246,28 @@ def process_pending(conn) -> dict:
         )
         mentioned_at = msg["ts"] or extract.snowflake_to_iso(msg["message_id"])
 
+        for word in re.findall(r"[A-Za-z]{%d,15}" % min_len, msg["content"] or ""):
+            token_key = known_tickers.get(word.upper())
+            if token_key and not any(
+                e["kind"] == "ticker" and e.get("symbol") == word.upper() for e in entities
+            ):
+                with conn:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO mentions
+                           (message_id, token_key, kind, raw, author, mentioned_at)
+                           VALUES (?, ?, 'ticker', ?, ?, ?)""",
+                        (msg["message_id"], token_key, word, msg["author"], mentioned_at),
+                    )
+                    stats["mentions"] += 1
+                entities.append({"kind": "ticker", "symbol": word.upper(), "raw": word,
+                                 "known": True})
+
         # Record mentions + enrich contract tokens (ticker->contract aliasing
         # happens when enrichment reveals the symbol).
         contract_keys_by_symbol = {}
         for e in entities:
+            if e.get("known"):
+                continue  # mention already recorded under the canonical key
             key = extract.token_key_for(e)
             if not key:
                 continue
@@ -231,8 +276,13 @@ def process_pending(conn) -> dict:
                     conn, key, e.get("chain_hint", "unknown"), e["address"], None
                 )
                 if snapshot.get("chain") and e.get("chain_hint") != snapshot["chain"]:
-                    key = extract.token_key_for(e, resolved_chain=snapshot["chain"])
+                    old_key, key = key, extract.token_key_for(e, resolved_chain=snapshot["chain"])
                     enrich.enrich_token(conn, key, snapshot["chain"], e["address"], None)
+                    with conn:  # merge the unresolved placeholder into the real chain key
+                        conn.execute(
+                            "UPDATE tokens SET alias_of = ? WHERE token_key = ? AND alias_of IS NULL",
+                            (key, old_key),
+                        )
                 if snapshot.get("symbol"):
                     contract_keys_by_symbol[snapshot["symbol"].upper()] = key
             with conn:
@@ -254,6 +304,19 @@ def process_pending(conn) -> dict:
                     )
 
         tier, reason = heuristic_tier(msg, entities)
+
+        # post-CA context bump: short banter from a recent contract-poster
+        # is an entry/exit signal, not noise
+        if tier == 3 and msg["author"] in last_ca_by_author:
+            try:
+                gap = datetime.fromisoformat(mentioned_at) - last_ca_by_author[msg["author"]]
+                if timedelta(0) <= gap <= timedelta(minutes=post_ca_min):
+                    tier, reason = 2, f"post-CA context ({msg['author']} shared a contract {int(gap.total_seconds() // 60)}min ago)"
+            except (TypeError, ValueError):
+                pass
+        if any(e["kind"] == "contract" for e in entities):
+            last_ca_by_author[msg["author"]] = datetime.fromisoformat(mentioned_at)
+
         if tier is not None:
             decided[msg["message_id"]] = (tier, reason)
             stats["heuristic"] += 1
