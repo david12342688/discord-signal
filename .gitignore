@@ -7,3 +7,5 @@ server/.env
 *.sqlite3
 *.db
 __pycache__/
+*.log
+.venv/
