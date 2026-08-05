@@ -18,6 +18,29 @@ channels:
   # (the extension has its own allowlist; this is defense in depth).
   allowlist: []
 
+enrich:
+  cache_ttl_s: 300            # re-fetch on-chain data after this many seconds
+  evm_chains: [bsc, base, ethereum]  # probe order for bare 0x addresses
+  dexscreener_interval_s: 0.3 # ~300 req/min allowed; stay well under
+  rugcheck_interval_s: 2.0
+  geckoterminal_interval_s: 2.5  # 30 req/min free tier
+  flags:                      # auto-skepticism thresholds
+    min_liquidity_usd: 10000
+    min_age_hours: 24
+    max_rug_score: 50
+    min_lp_locked_pct: 50
+
+classify:
+  noise_max_len: 12           # <= this many chars with no entities -> noise check
+  short_banter_max_len: 25    # short + no entities + no meta words -> tier 3
+  consensus:
+    window_minutes: 15        # 3+ distinct authors on one token inside this window
+    min_authors: 3
+  llm:
+    triage_model: claude-haiku-4-5    # cheap model for the ambiguous remainder
+    escalation_model: claude-opus-5   # only for genuinely unclear cases
+    batch_size: 30
+
 watchdog:
   # Alert if zero messages arrive for this long during active hours.
   quiet_minutes: 60
